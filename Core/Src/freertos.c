@@ -19,11 +19,26 @@
 #include "sensor_data.h"
 #include "stdio.h"
 #include "string.h"
+#include "w25q64.h"
+
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#define LOG_MAGIC 0xA5
+#define FLASH_LOG_START_ADDR 0x000000
+#define FLASH_LOG_SECTOR_SIZE 4096
+typedef struct {
+  uint8_t magic;
+  uint32_t timestamp;
+  int16_t accel_x;
+  int16_t accel_y;
+  int16_t accel_z;
+  uint8_t reserved[4]; // 4 bytes (Padding)
+  uint8_t checksum;
+  // total: 16 Bytes
+} __attribute__((packed)) LogEntry_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -39,12 +54,16 @@
 uint8_t rx_data;
 extern UART_HandleTypeDef huart1;
 extern I2C_HandleTypeDef hi2c1;
+
+uint32_t s_log_addr = FLASH_LOG_START_ADDR;
+bool s_logging_active = false;
+uint32_t s_log_entry_count = 0;
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
     .name = "defaultTask",
-    .stack_size = 256 * 4,
+    .stack_size = 512 * 4,
     .priority = (osPriority_t)osPriorityNormal,
 };
 /* Definitions for uart_rx_queue */
@@ -54,6 +73,8 @@ const osMessageQueueAttr_t uart_rx_queue_attributes = {.name = "uart_rx_queue"};
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 void SensorTask_Entry(void *argument);
+void LoggerTask_Entry(void *argument);
+uint8_t calc_entry_checksum(LogEntry_t *entry);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -86,6 +107,13 @@ void MX_FREERTOS_Init(void) {
       .priority = (osPriority_t)osPriorityAboveNormal,
   };
   osThreadNew(SensorTask_Entry, NULL, &sensorTask_attr);
+
+  const osThreadAttr_t loggerTask_attr = {
+      .name = "LoggerTask",
+      .stack_size = 256 * 4,
+      .priority = (osPriority_t)osPriorityBelowNormal,
+  };
+  osThreadNew(LoggerTask_Entry, NULL, &loggerTask_attr);
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
@@ -186,6 +214,60 @@ void StartDefaultTask(void *argument) {
             uint8_t err[] = "Error: Sensor data is busy!\r\n";
             HAL_UART_Transmit(&huart1, err, strlen((char *)err), HAL_MAX_DELAY);
           }
+        } else if (strcmp(local_buffer, "log start") == 0) {
+          W25Q64_SectorErase(FLASH_LOG_START_ADDR);
+          s_log_addr = FLASH_LOG_START_ADDR;
+          s_log_entry_count = 0;
+          s_logging_active = true;
+          char res[] = "Logging started! (1 record/sec)\r\n";
+          HAL_UART_Transmit(&huart1, (uint8_t *)res, strlen(res),
+                            HAL_MAX_DELAY);
+
+        } else if (strcmp(local_buffer, "log stop") == 0) {
+          s_logging_active = false;
+          char res[60];
+          snprintf(res, sizeof(res),
+                   "Logging stopped. %lu entries recorded.\r\n",
+                   s_log_entry_count);
+          HAL_UART_Transmit(&huart1, (uint8_t *)res, strlen(res),
+                            HAL_MAX_DELAY);
+
+        } else if (strcmp(local_buffer, "log dump") == 0) {
+          char header[] = "--- Log Dump Start ---\r\n";
+          HAL_UART_Transmit(&huart1, (uint8_t *)header, strlen(header),
+                            HAL_MAX_DELAY);
+
+          uint32_t addr = FLASH_LOG_START_ADDR;
+          for (uint32_t i = 0; i < s_log_entry_count; i++) {
+            LogEntry_t entry;
+            W25Q64_Read(addr, (uint8_t *)&entry, sizeof(LogEntry_t));
+
+            char entry_str[100];
+            if (entry.magic != LOG_MAGIC ||
+                entry.checksum != calc_entry_checksum(&entry)) {
+              snprintf(entry_str, sizeof(entry_str), "[%lu] CORRUPTED DATA\r\n",
+                       i);
+            } else {
+              snprintf(entry_str, sizeof(entry_str),
+                       "[%lu] T:%lu | X:%d Y:%d Z:%d\r\n", i, entry.timestamp,
+                       entry.accel_x, entry.accel_y, entry.accel_z);
+            }
+            HAL_UART_Transmit(&huart1, (uint8_t *)entry_str, strlen(entry_str),
+                              HAL_MAX_DELAY);
+            addr += sizeof(LogEntry_t);
+          }
+          char footer[] = "--- Log Dump End ---\r\n";
+          HAL_UART_Transmit(&huart1, (uint8_t *)footer, strlen(footer),
+                            HAL_MAX_DELAY);
+
+        } else if (strcmp(local_buffer, "log clear") == 0) {
+          s_logging_active = false;
+          W25Q64_SectorErase(FLASH_LOG_START_ADDR);
+          s_log_addr = FLASH_LOG_START_ADDR;
+          s_log_entry_count = 0;
+          char res[] = "Flash Sector 0 cleared.\r\n";
+          HAL_UART_Transmit(&huart1, (uint8_t *)res, strlen(res),
+                            HAL_MAX_DELAY);
         } else if (local_index > 0) {
           uint8_t res[] = "Error: Unknown command!\r\n";
           HAL_UART_Transmit(&huart1, res, strlen((char *)res), HAL_MAX_DELAY);
@@ -235,6 +317,50 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 
     // ready for next character
     HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+  }
+}
+
+uint8_t calc_entry_checksum(LogEntry_t *entry) {
+  uint8_t *p = (uint8_t *)entry;
+  uint8_t cs = 0;
+  for (size_t i = 0; i < sizeof(LogEntry_t) - 1; i++) {
+    cs ^= p[i];
+  }
+  return cs;
+}
+
+void LoggerTask_Entry(void *argument) {
+  for (;;) {
+    if (s_logging_active) {
+      SensorData_t snapshot;
+
+      if (SensorData_Read(&snapshot) == true) {
+
+        LogEntry_t entry = {.magic = LOG_MAGIC,
+                            .timestamp = snapshot.timestamp,
+                            .accel_x = snapshot.accel_x,
+                            .accel_y = snapshot.accel_y,
+                            .accel_z = snapshot.accel_z,
+                            .reserved = {0xFF, 0xFF, 0xFF, 0xFF},
+                            .checksum = 0};
+        entry.checksum = calc_entry_checksum(&entry);
+
+        W25Q64_PageProgram(s_log_addr, (uint8_t *)&entry, sizeof(LogEntry_t));
+        s_log_addr += sizeof(LogEntry_t);
+        s_log_entry_count++;
+
+        if (s_log_addr + sizeof(LogEntry_t) >
+            FLASH_LOG_START_ADDR + FLASH_LOG_SECTOR_SIZE) {
+          s_logging_active = false;
+          char msg[] =
+              "\r\n[Warning] Flash Sector Full. Logging stopped.\r\n> ";
+          HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg),
+                            HAL_MAX_DELAY);
+        }
+      }
+    }
+    // 1 record/sec
+    osDelay(1000);
   }
 }
 /* USER CODE END Application */

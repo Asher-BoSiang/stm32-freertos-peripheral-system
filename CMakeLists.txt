@@ -46,6 +46,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/sensor_data.c
+    Core/Src/w25q64.c
+    Core/Inc/w25q64.h
 )
 
 # Add include paths
