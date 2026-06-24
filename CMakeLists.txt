@@ -48,6 +48,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/sensor_data.c
     Core/Src/w25q64.c
     Core/Inc/w25q64.h
+    Core/Inc/protocol.h
+    Core/Src/protocol.c
 )
 
 # Add include paths

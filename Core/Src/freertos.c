@@ -13,14 +13,13 @@
 #include "main.h"
 #include "task.h"
 
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "protocol.h"
 #include "sensor_data.h"
 #include "stdio.h"
 #include "string.h"
 #include "w25q64.h"
-
 
 /* USER CODE END Includes */
 
@@ -39,6 +38,12 @@ typedef struct {
   uint8_t checksum;
   // total: 16 Bytes
 } __attribute__((packed)) LogEntry_t;
+
+// define feedback to host
+#define CMD_RESP_ACCEL 0x81
+#define CMD_RESP_LOG_ENTRY 0x82
+#define CMD_RESP_ACK 0xFF
+#define CMD_RESP_ERROR 0xFE
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -75,6 +80,7 @@ const osMessageQueueAttr_t uart_rx_queue_attributes = {.name = "uart_rx_queue"};
 void SensorTask_Entry(void *argument);
 void LoggerTask_Entry(void *argument);
 uint8_t calc_entry_checksum(LogEntry_t *entry);
+void Send_Binary_Response(uint8_t cmd, uint8_t length, uint8_t *data);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -178,11 +184,107 @@ void StartDefaultTask(void *argument) {
   uint8_t local_index = 0;
   uint8_t received_byte;
 
+  ProtoParser_t bin_parser;
+  Proto_Init(&bin_parser);
+  Packet_t rx_packet;
+
   /* Infinite loop */
   for (;;) {
     if (osMessageQueueGet(uart_rx_queueHandle, &received_byte, NULL,
                           osWaitForever) == osOK) {
-      // Echo
+      if (Proto_ProcessByte(&bin_parser, received_byte, &rx_packet) == true) {
+        switch (rx_packet.cmd) {
+
+        case CMD_GET_ACCEL: {
+          SensorData_t snapshot;
+          if (SensorData_Read(&snapshot) == true) {
+            uint8_t payload[6];
+            payload[0] = (snapshot.accel_x >> 8) & 0xFF;
+            payload[1] = snapshot.accel_x & 0xFF;
+            payload[2] = (snapshot.accel_y >> 8) & 0xFF;
+            payload[3] = snapshot.accel_y & 0xFF;
+            payload[4] = (snapshot.accel_z >> 8) & 0xFF;
+            payload[5] = snapshot.accel_z & 0xFF;
+            Send_Binary_Response(CMD_RESP_ACCEL, 6, payload);
+          } else {
+            uint8_t err_code = 0x01;
+            Send_Binary_Response(CMD_RESP_ERROR, 1, &err_code);
+          }
+          break;
+        }
+
+        case CMD_SET_LED: {
+          if (rx_packet.length >= 1) {
+            if (rx_packet.data[0] == 1) {
+              HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET); // 開燈
+            } else {
+              HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET); // 關燈
+            }
+            // Return ACK
+            uint8_t ack_cmd = rx_packet.cmd;
+            Send_Binary_Response(CMD_RESP_ACK, 1, &ack_cmd);
+          }
+          break;
+        }
+        case CMD_LOG_START: {
+          W25Q64_SectorErase(FLASH_LOG_START_ADDR);
+          s_log_addr = FLASH_LOG_START_ADDR;
+          s_log_entry_count = 0;
+          s_logging_active = true;
+
+          uint8_t ack_cmd = rx_packet.cmd;
+          Send_Binary_Response(CMD_RESP_ACK, 1, &ack_cmd);
+          break;
+        }
+
+        case CMD_LOG_STOP: {
+          s_logging_active = false;
+          uint8_t ack_cmd = rx_packet.cmd;
+          Send_Binary_Response(CMD_RESP_ACK, 1, &ack_cmd);
+          break;
+        }
+
+        case CMD_LOG_DUMP: {
+          uint32_t addr = FLASH_LOG_START_ADDR;
+          for (uint32_t i = 0; i < s_log_entry_count; i++) {
+            LogEntry_t entry;
+            W25Q64_Read(addr, (uint8_t *)&entry, sizeof(LogEntry_t));
+
+            if (entry.magic == LOG_MAGIC &&
+                entry.checksum == calc_entry_checksum(&entry)) {
+              uint8_t payload[10];
+              // Timestamp (32-bit) to 4 bytes (Big-Endian)
+              payload[0] = (entry.timestamp >> 24) & 0xFF;
+              payload[1] = (entry.timestamp >> 16) & 0xFF;
+              payload[2] = (entry.timestamp >> 8) & 0xFF;
+              payload[3] = entry.timestamp & 0xFF;
+              // Accel X, Y, Z (16-bit) to 6 bytes (Big-Endian)
+              payload[4] = (entry.accel_x >> 8) & 0xFF;
+              payload[5] = entry.accel_x & 0xFF;
+              payload[6] = (entry.accel_y >> 8) & 0xFF;
+              payload[7] = entry.accel_y & 0xFF;
+              payload[8] = (entry.accel_z >> 8) & 0xFF;
+              payload[9] = entry.accel_z & 0xFF;
+
+              Send_Binary_Response(CMD_RESP_LOG_ENTRY, 10, payload);
+              osDelay(5);
+            }
+            addr += sizeof(LogEntry_t);
+          }
+          // Return ACK After Dump
+          uint8_t ack_cmd = rx_packet.cmd;
+          Send_Binary_Response(CMD_RESP_ACK, 1, &ack_cmd);
+          break;
+        }
+        }
+        continue;
+      }
+
+      if (bin_parser.state != PROTO_STATE_WAIT_START || received_byte >= 128) {
+        continue;
+      }
+
+      // Return Echo While Using ASCII CLI
       HAL_UART_Transmit(&huart1, &received_byte, 1, HAL_MAX_DELAY);
 
       if (received_byte == '\r' || received_byte == '\n') {
@@ -362,5 +464,21 @@ void LoggerTask_Entry(void *argument) {
     // 1 record/sec
     osDelay(1000);
   }
+}
+
+void Send_Binary_Response(uint8_t cmd, uint8_t length, uint8_t *data) {
+  uint8_t tx_buf[32];
+  tx_buf[0] = 0xAA;
+  tx_buf[1] = cmd;
+  tx_buf[2] = length;
+
+  uint8_t checksum = cmd ^ length;
+  for (int i = 0; i < length; i++) {
+    tx_buf[3 + i] = data[i];
+    checksum ^= data[i];
+  }
+  tx_buf[3 + length] = checksum;
+
+  HAL_UART_Transmit(&huart1, tx_buf, 4 + length, HAL_MAX_DELAY);
 }
 /* USER CODE END Application */
