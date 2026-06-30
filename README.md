@@ -1,3 +1,4 @@
+<img width="960" height="438" alt="Python GUI" src="https://github.com/user-attachments/assets/6a444ddf-c23d-46b8-930f-1ffb2ef0247e" />
 # STM32 Freertos Peripheral System
 
 ![STM32](https://img.shields.io/badge/MCU-STM32F103-blue.svg)
@@ -13,9 +14,11 @@ A core feature of this system is its **Dual-Mode UART Interface**, which utilize
 ## Demo
 
 ### 1. Python GUI (Binary Protocol)
+<img width="960" height="438" alt="Python GUI" src="https://github.com/user-attachments/assets/15fb47ba-53f7-4f60-b5c3-2a3915f7992e" />
 *Real-time binary packet parsing. Acceleration updates as the MPU6500 IMU is moved.*
 
 ### 2. ASCII Command Shell
+<img width="960" height="434" alt="ACSII Command Shell" src="https://github.com/user-attachments/assets/729baf38-312e-4c59-9c0c-9ddfd878c70b" />
 *Sending UART commands via CoolTerm to control hardware and Flash operations.*
 
 ## Features
