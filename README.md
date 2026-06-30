@@ -1,4 +1,3 @@
-<img width="960" height="438" alt="Python GUI" src="https://github.com/user-attachments/assets/6a444ddf-c23d-46b8-930f-1ffb2ef0247e" />
 # STM32 Freertos Peripheral System
 
 ![STM32](https://img.shields.io/badge/MCU-STM32F103-blue.svg)
